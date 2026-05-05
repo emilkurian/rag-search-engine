@@ -6,9 +6,13 @@ import os
 import pickle
 from collections import Counter
 import math
+from cli.lib.semantic_search import verify_model
+from cli.lib.keyword_search import InvertedIndex
+
 
 stemmer = PorterStemmer()
-
+BM25_K1 = 1.5
+BM25_B = 0.75
 
 translator = str.maketrans("", "", string.punctuation)
 
@@ -16,132 +20,17 @@ with open("data/stopwords.txt", "r") as stop_words:
     stop_word_list = stop_words.read().splitlines()
 
 
-class InvertedIndex:
+def bm25_idf_command(term: str) -> float:
+    index = InvertedIndex()
 
-    def __init__(self):
-        self.index = dict()
-        self.docmap = dict()
-        self.term_frequencies = dict()
+    index.load()
 
-    def __add_document(self, doc_id, text):
-        """
-        Tokenize text and add tokens to the index + term frequencies
-        """
-        # normalize text
-        text = text.lower().translate(translator)
-        tokens = text.split()
+    return index.get_bm25_idf(term)
 
-        # init counter for this doc
-        if doc_id not in self.term_frequencies:
-            self.term_frequencies[doc_id] = Counter()
-
-        for token in tokens:
-            if token in stop_word_list:
-                continue
-
-            stemmed = stemmer.stem(token)
-
-            # update inverted index
-            if stemmed not in self.index:
-                self.index[stemmed] = set()
-            self.index[stemmed].add(doc_id)
-
-            # update term frequency
-            self.term_frequencies[doc_id][stemmed] += 1
-
-    def get_documents(self, term):
-        """
-        Return sorted list of document IDs for a term
-        """
-        # apply same preprocessing as indexing
-        term = term.lower().translate(translator)
-
-        if term in stop_word_list:
-            return []
-
-        stemmed = stemmer.stem(term)
-
-        if stemmed not in self.index:
-            return []
-
-        return sorted(self.index[stemmed])
-
-    def build(self, movies):
-        """
-        Build index from all movie documents
-        """
-        for m in movies:
-            doc_id = m["id"]
-
-            # combine title + description
-            text = f"{m['title']} {m['description']}"
-
-            # store full movie object (overwrites text stored earlier, which is fine)
-            self.docmap[doc_id] = m
-
-            # add to index
-            self.__add_document(doc_id, text)
-
-    def save(self):
-        """
-        Save index and docmap to disk using pickle
-        """
-        os.makedirs("cache", exist_ok=True)
-
-        with open("cache/index.pkl", "wb") as f:
-            pickle.dump(self.index, f)
-
-        with open("cache/docmap.pkl", "wb") as f:
-            pickle.dump(self.docmap, f)
-
-        with open("cache/term_frequencies.pkl", "wb") as f:
-            pickle.dump(self.term_frequencies, f)
-
-    def load(self):
-        """
-        Load index and docmap from disk using pickle
-        """
-        index_path = "cache/index.pkl"
-        docmap_path = "cache/docmap.pkl"
-        tf_path = "cache/term_frequencies.pkl"
-
-        # ensure both files exist
-        if not os.path.exists(index_path) or not os.path.exists(docmap_path) or not os.path.exists(tf_path):
-            raise FileNotFoundError("Index files not found. Please run the 'build' command first.")
-
-        # load index
-        with open(index_path, "rb") as f:
-            self.index = pickle.load(f)
-
-        # load docmap
-        with open(docmap_path, "rb") as f:
-            self.docmap = pickle.load(f)
-
-        with open(tf_path, "rb") as f:
-            self.term_frequencies = pickle.load(f)
-    
-    def get_tf(self, doc_id, term):
-        """
-        Return term frequency for a term in a document
-        """
-        # normalize
-        term = term.lower().translate(translator)
-        tokens = term.split()
-
-        if len(tokens) != 1:
-            raise ValueError("Only single terms are allowed")
-
-        token = tokens[0]
-
-        if token in stop_word_list:
-            return 0
-
-        stemmed = stemmer.stem(token)
-
-        if doc_id not in self.term_frequencies:
-            return 0
-
-        return self.term_frequencies[doc_id].get(stemmed, 0)
+def bm25_tf_command(doc_id, term, k1=BM25_K1, b=BM25_B):
+    index = InvertedIndex()
+    index.load()
+    return index.get_bm25_tf(doc_id, term, k1, b)
          
 
 
@@ -157,6 +46,26 @@ def main() -> None:
     search_parser.add_argument("query", type=str, help="Search query")
     idf_parser = subparsers.add_parser("idf", help="Inverse Document Frequency")
     idf_parser.add_argument("term", type=str, help="Term to check")
+    tfidf_parser = subparsers.add_parser("tfidf", help="Compute TF-IDF score")
+    tfidf_parser.add_argument("doc_id", type=int, help="Document ID")
+    tfidf_parser.add_argument("term", type=str, help="Term to check")
+    bm25_idf_parser = subparsers.add_parser("bm25idf", help="Get BM25 IDF score for a given term")
+    bm25_idf_parser.add_argument("term", type=str, help="Term to get BM25 IDF score for")
+    bm25_tf_parser = subparsers.add_parser(
+        "bm25tf", help="Get BM25 TF score for a given document ID and term"
+    )
+    bm25_tf_parser.add_argument("doc_id", type=int)
+    bm25_tf_parser.add_argument("term", type=str)
+    bm25_tf_parser.add_argument("k1", type=float, nargs="?", default=BM25_K1)
+    bm25_tf_parser.add_argument("b", type=float, nargs="?", default=BM25_B)
+    bm25search_parser = subparsers.add_parser(
+        "bm25search", help="Search movies using full BM25 scoring"
+    )
+    bm25search_parser.add_argument("query", type=str, help="Search query")
+    bm25search_parser.add_argument("--limit", type=int, default=5, help="Number of results to return")
+    verify_parser = subparsers.add_parser(
+        "verify", help="Verify embedding model setup"
+    )
 
     args = parser.parse_args()
 
@@ -255,6 +164,69 @@ def main() -> None:
             idf = math.log((N + 1) / (df + 1))
 
             print(f"{idf:.2f}")
+
+        case "tfidf":
+            index = InvertedIndex()
+
+            try:
+                index.load()
+            except FileNotFoundError as e:
+                print(e)
+                return
+
+            # normalize term
+            term = args.term.lower().translate(translator)
+
+            if term in stop_word_list:
+                print(f"TF-IDF score of '{args.term}' in document '{args.doc_id}': 0.00")
+                return
+
+            stemmed = stemmer.stem(term)
+
+            # --- TF ---
+            tf = index.get_tf(args.doc_id, term)
+
+            # --- IDF ---
+            N = len(index.docmap)
+            df = len(index.index.get(stemmed, []))
+            idf = math.log((N + 1) / (df + 1))
+
+            # --- TF-IDF ---
+            tf_idf = tf * idf
+
+            print(f"TF-IDF score of '{args.term}' in document '{args.doc_id}': {tf_idf:.2f}")
+
+        case "bm25idf":
+            try:
+                bm25idf = bm25_idf_command(args.term)
+                print(f"BM25 IDF score of '{args.term}': {bm25idf:.2f}")
+            except FileNotFoundError as e:
+                print(e)
+
+        case "bm25tf":
+            try:
+                bm25tf = bm25_tf_command(args.doc_id, args.term, args.k1, args.b)
+                print(f"BM25 TF score of '{args.term}' in document '{args.doc_id}': {bm25tf:.2f}")
+            except FileNotFoundError as e:
+                print(e)
+
+        case "bm25search":
+            index = InvertedIndex()
+
+            try:
+                index.load()
+            except FileNotFoundError as e:
+                print(e)
+                return
+
+            results = index.bm25_search(args.query, args.limit)
+
+            for i, (doc_id, score) in enumerate(results, 1):
+                movie = index.docmap[doc_id]
+                print(f"{i}. ({doc_id}) {movie['title']} - Score: {score:.2f}")
+
+        case "verify":
+            verify_model()
             
         case _:
             parser.print_help()
